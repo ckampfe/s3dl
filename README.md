@@ -3,7 +3,7 @@
 ## install
 
 ```
-$ cargo install --git https://github.com/ckampfe/s3dl
+$ cargo install --git https://github.com/ckampfe/s3dl --branch main
 ```
 
 ## example
