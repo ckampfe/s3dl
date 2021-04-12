@@ -1,5 +1,7 @@
 # s3dl
 
+Download files from S3 in parallel
+
 ## install
 
 ```
