@@ -1,12 +1,12 @@
 use anyhow::{Context, Result};
+use futures_util::StreamExt;
 use rusoto_core::Region;
 use rusoto_s3::S3;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use structopt::*;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::mpsc;
 
 const DEFAULT_CHANNEL_BUFFER_CAPACITY: &str = "100";
 
@@ -116,11 +116,11 @@ async fn download_keys(
 
     let keys_lines = keys.lines();
 
-    let mut reqs = Vec::new();
+    let ls = futures_util::stream::iter(keys_lines);
 
-    for line in keys_lines {
+    let reqs = ls.map(|line| -> Result<(String, rusoto_s3::GetObjectRequest)> {
         let key = line?;
-        reqs.push((
+        Ok((
             key.clone(),
             rusoto_s3::GetObjectRequest {
                 bucket: bucket.clone(),
@@ -128,60 +128,59 @@ async fn download_keys(
                 ..Default::default()
             },
         ))
-    }
+    });
 
-    let mut tasks = Vec::with_capacity(reqs.len());
-
-    let semaphore = Arc::new(Semaphore::new(max_inflight_requests));
-
-    for (key, req) in reqs {
+    let s = reqs.map(|res| {
         // these are all just copying pointers
         let stdout_s = stdout_s.clone();
         let stderr_s = stderr_s.clone();
         let mut out = out_path.clone();
         let client = client.clone();
 
-        let permit = Arc::clone(&semaphore).acquire_owned().await?;
+        async move {
+            match res {
+                Ok((key, req)) => {
+                    stdout_s.send(format!("{}: started\n", key)).await.unwrap();
 
-        let task = tokio::spawn(async move {
-            let _permit = permit;
+                    match client.get_object(req).await {
+                        Ok(resp) => {
+                            let filename = Path::new(&key).file_name().unwrap();
 
-            stdout_s.send(format!("{}: started\n", key)).await.unwrap();
+                            out.push(filename);
 
-            match client.get_object(req).await {
-                Ok(resp) => {
-                    let filename = Path::new(&key).file_name().unwrap();
+                            let mut file = tokio::fs::File::create(&out)
+                                .await
+                                .with_context(|| format!("Could not create local file: {:?}", out))
+                                .unwrap();
 
-                    out.push(filename);
-
-                    let mut file = tokio::fs::File::create(&out)
-                        .await
-                        .with_context(|| format!("Could not create local file: {:?}", out))
-                        .unwrap();
-
-                    if let Some(body) = resp.body {
-                        let mut async_body = body.into_async_read();
-                        match tokio::io::copy(&mut async_body, &mut file).await {
-                            Ok(_) => stdout_s.send(format!("{}: finished\n", key)).await.unwrap(),
-                            Err(e) => stderr_s.send(format!("{}: {:?}", key, e)).await.unwrap(),
-                        };
-                    } else {
-                        stderr_s
-                            .send(format!("{}: response body was empty\n", key))
-                            .await
-                            .unwrap()
+                            if let Some(body) = resp.body {
+                                let mut async_body = body.into_async_read();
+                                match tokio::io::copy(&mut async_body, &mut file).await {
+                                    Ok(_) => {
+                                        stdout_s.send(format!("{}: finished\n", key)).await.unwrap()
+                                    }
+                                    Err(e) => {
+                                        stderr_s.send(format!("{}: {:?}", key, e)).await.unwrap()
+                                    }
+                                };
+                            } else {
+                                stderr_s
+                                    .send(format!("{}: response body was empty\n", key))
+                                    .await
+                                    .unwrap()
+                            }
+                        }
+                        Err(e) => stderr_s.send(format!("{}: {:?}", key, e)).await.unwrap(),
                     }
                 }
-                Err(e) => stderr_s.send(format!("{}: {:?}", key, e)).await.unwrap(),
+                Err(e) => stderr_s.send(format!("{}", e)).await.unwrap(),
             }
-        });
+        }
+    });
 
-        tasks.push(task);
-    }
+    let mut buffered = s.buffer_unordered(max_inflight_requests);
 
-    for task in tasks {
-        task.await?
-    }
+    while buffered.next().await.is_some() {}
 
     Ok(())
 }
