@@ -1,12 +1,11 @@
 use anyhow::{Context, Result};
+use futures_util::StreamExt;
 use rusoto_core::Region;
 use rusoto_s3::S3;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use structopt::*;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{mpsc, Semaphore};
 
 const DEFAULT_CHANNEL_BUFFER_CAPACITY: &str = "100";
 
@@ -50,8 +49,8 @@ struct Options {
 async fn main() -> Result<()> {
     let options = Options::from_args();
 
-    let (stdout_s, mut stdout_r) = mpsc::channel(options.stdout_channel_capacity);
-    let (stderr_s, mut stderr_r) = mpsc::channel(options.stderr_channel_capacity);
+    let (stdout_s, mut stdout_r) = tokio::sync::mpsc::channel(options.stdout_channel_capacity);
+    let (stderr_s, mut stderr_r) = tokio::sync::mpsc::channel(options.stderr_channel_capacity);
 
     let mut stdout = tokio::io::stdout();
     let mut stderr = tokio::io::stderr();
@@ -107,81 +106,82 @@ async fn download_keys(
     bucket: String,
     keys_path: PathBuf,
     out_path: PathBuf,
-    stdout_s: mpsc::Sender<String>,
-    stderr_s: mpsc::Sender<String>,
+    stdout_s: tokio::sync::mpsc::Sender<String>,
+    stderr_s: tokio::sync::mpsc::Sender<String>,
     max_inflight_requests: usize,
 ) -> Result<()> {
-    let keys = std::fs::File::open(&keys_path)?;
-    let keys = std::io::BufReader::new(keys);
+    let keys_file = std::fs::File::open(&keys_path)?;
+    let keys_buf = std::io::BufReader::new(keys_file);
+    let keys_lines = futures_util::stream::iter(keys_buf.lines());
 
-    let keys_lines = keys.lines();
+    let stream = keys_lines
+        .map(|line| -> Result<(String, rusoto_s3::GetObjectRequest)> {
+            let key = line?;
+            Ok((
+                key.clone(),
+                rusoto_s3::GetObjectRequest {
+                    bucket: bucket.clone(),
+                    key,
+                    ..Default::default()
+                },
+            ))
+        })
+        .map(|res| {
+            // these are all just copying pointers
+            let stdout_s = stdout_s.clone();
+            let stderr_s = stderr_s.clone();
+            let mut out = out_path.clone();
+            let client = client.clone();
 
-    let mut reqs = Vec::new();
+            async move {
+                match res {
+                    Ok((key, req)) => {
+                        stdout_s.send(format!("{}: started\n", key)).await.unwrap();
 
-    for line in keys_lines {
-        let key = line?;
-        reqs.push((
-            key.clone(),
-            rusoto_s3::GetObjectRequest {
-                bucket: bucket.clone(),
-                key,
-                ..Default::default()
-            },
-        ))
-    }
+                        match client.get_object(req).await {
+                            Ok(resp) => {
+                                let filename = Path::new(&key).file_name().unwrap();
 
-    let mut tasks = Vec::with_capacity(reqs.len());
+                                out.push(filename);
 
-    let semaphore = Arc::new(Semaphore::new(max_inflight_requests));
+                                let mut file = tokio::fs::File::create(&out)
+                                    .await
+                                    .with_context(|| {
+                                        format!("Could not create local file: {:?}", out)
+                                    })
+                                    .unwrap();
 
-    for (key, req) in reqs {
-        // these are all just copying pointers
-        let stdout_s = stdout_s.clone();
-        let stderr_s = stderr_s.clone();
-        let mut out = out_path.clone();
-        let client = client.clone();
-
-        let permit = Arc::clone(&semaphore).acquire_owned().await?;
-
-        let task = tokio::spawn(async move {
-            let _permit = permit;
-
-            stdout_s.send(format!("{}: started\n", key)).await.unwrap();
-
-            match client.get_object(req).await {
-                Ok(resp) => {
-                    let filename = Path::new(&key).file_name().unwrap();
-
-                    out.push(filename);
-
-                    let mut file = tokio::fs::File::create(&out)
-                        .await
-                        .with_context(|| format!("Could not create local file: {:?}", out))
-                        .unwrap();
-
-                    if let Some(body) = resp.body {
-                        let mut async_body = body.into_async_read();
-                        match tokio::io::copy(&mut async_body, &mut file).await {
-                            Ok(_) => stdout_s.send(format!("{}: finished\n", key)).await.unwrap(),
+                                if let Some(body) = resp.body {
+                                    let mut async_body = body.into_async_read();
+                                    match tokio::io::copy(&mut async_body, &mut file).await {
+                                        Ok(_) => stdout_s
+                                            .send(format!("{}: finished\n", key))
+                                            .await
+                                            .unwrap(),
+                                        Err(e) => stderr_s
+                                            .send(format!("{}: {:?}", key, e))
+                                            .await
+                                            .unwrap(),
+                                    };
+                                } else {
+                                    stderr_s
+                                        .send(format!("{}: response body was empty\n", key))
+                                        .await
+                                        .unwrap()
+                                }
+                            }
                             Err(e) => stderr_s.send(format!("{}: {:?}", key, e)).await.unwrap(),
-                        };
-                    } else {
-                        stderr_s
-                            .send(format!("{}: response body was empty\n", key))
-                            .await
-                            .unwrap()
+                        }
                     }
+                    Err(e) => stderr_s.send(format!("{}", e)).await.unwrap(),
                 }
-                Err(e) => stderr_s.send(format!("{}: {:?}", key, e)).await.unwrap(),
             }
         });
 
-        tasks.push(task);
-    }
+    let mut buffered = stream.buffer_unordered(max_inflight_requests);
 
-    for task in tasks {
-        task.await?
-    }
+    // we do it this way because Rust does not have async for-loops yet
+    while buffered.next().await.is_some() {}
 
     Ok(())
 }
