@@ -6,6 +6,8 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use structopt::*;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc::channel;
+use tokio::sync::mpsc::{Receiver, Sender};
 
 const DEFAULT_CHANNEL_BUFFER_CAPACITY: &str = "100";
 
@@ -49,24 +51,23 @@ struct Options {
 async fn main() -> Result<()> {
     let options = Options::from_args();
 
-    let (stdout_s, mut stdout_r) = tokio::sync::mpsc::channel(options.stdout_channel_capacity);
-    let (stderr_s, mut stderr_r) = tokio::sync::mpsc::channel(options.stderr_channel_capacity);
+    let (stdout_s, mut stdout_r): (Sender<String>, Receiver<String>) =
+        channel(options.stdout_channel_capacity);
+    let (stderr_s, mut stderr_r): (Sender<String>, Receiver<String>) =
+        channel(options.stderr_channel_capacity);
 
     let mut stdout = tokio::io::stdout();
     let mut stderr = tokio::io::stderr();
 
     let stdout_task = tokio::spawn(async move {
-        while let Some(m) = stdout_r.recv().await {
-            let m: String = m;
-            let bytes = m.as_bytes();
-            stdout.write_all(bytes).await.unwrap();
+        while let Some(msg) = stdout_r.recv().await {
+            stdout.write_all(msg.as_bytes()).await.unwrap();
         }
     });
 
     let stderr_task = tokio::spawn(async move {
-        while let Some(m) = stderr_r.recv().await {
-            let m: String = m;
-            stderr.write_all(m.as_bytes()).await.unwrap();
+        while let Some(msg) = stderr_r.recv().await {
+            stderr.write_all(msg.as_bytes()).await.unwrap();
         }
     });
 
@@ -106,8 +107,8 @@ async fn download_keys(
     bucket: String,
     keys_path: PathBuf,
     out_path: PathBuf,
-    stdout_s: tokio::sync::mpsc::Sender<String>,
-    stderr_s: tokio::sync::mpsc::Sender<String>,
+    stdout_s: Sender<String>,
+    stderr_s: Sender<String>,
     max_inflight_requests: usize,
 ) -> Result<()> {
     let keys_file = std::fs::File::open(&keys_path)?;
