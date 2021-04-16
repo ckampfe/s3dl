@@ -47,6 +47,20 @@ struct Options {
     stderr_channel_capacity: usize,
 }
 
+macro_rules! ok_or_send_err {
+    ($result:expr, $err_fmt_str:expr, $err_chan:ident) => {
+        match $result {
+            Ok(value) => value,
+            Err(e) => {
+                return $err_chan
+                    .send(format!(concat!($err_fmt_str, "\n"), e))
+                    .await
+                    .unwrap()
+            }
+        }
+    };
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let options = Options::from_args();
@@ -135,47 +149,39 @@ async fn download_keys(
             let client = client.clone();
 
             async move {
-                match res {
-                    Ok((key, req)) => {
-                        stdout_s.send(format!("{}: started\n", key)).await.unwrap();
+                let (key, req) = ok_or_send_err!(res, "{}", stderr_s);
 
-                        match client.get_object(req).await {
-                            Ok(resp) => {
-                                let filename = Path::new(&key).file_name().unwrap();
+                stdout_s.send(format!("{}: started\n", key)).await.unwrap();
 
-                                out.push(filename);
+                let resp = ok_or_send_err!(client.get_object(req).await, "{}", stderr_s);
 
-                                let mut file = tokio::fs::File::create(&out)
-                                    .await
-                                    .with_context(|| {
-                                        format!("Could not create local file: {:?}", out)
-                                    })
-                                    .unwrap();
+                let filename = Path::new(&key).file_name().unwrap();
 
-                                if let Some(body) = resp.body {
-                                    let mut async_body = body.into_async_read();
-                                    match tokio::io::copy(&mut async_body, &mut file).await {
-                                        Ok(_) => stdout_s
-                                            .send(format!("{}: finished\n", key))
-                                            .await
-                                            .unwrap(),
-                                        Err(e) => stderr_s
-                                            .send(format!("{}: {:?}", key, e))
-                                            .await
-                                            .unwrap(),
-                                    };
-                                } else {
-                                    stderr_s
-                                        .send(format!("{}: response body was empty\n", key))
-                                        .await
-                                        .unwrap()
-                                }
-                            }
-                            Err(e) => stderr_s.send(format!("{}: {:?}", key, e)).await.unwrap(),
-                        }
-                    }
-                    Err(e) => stderr_s.send(format!("{}", e)).await.unwrap(),
-                }
+                out.push(filename);
+
+                let mut file = ok_or_send_err!(
+                    tokio::fs::File::create(&out)
+                        .await
+                        .with_context(|| format!("Could not create local file: {:?}", out)),
+                    "{}",
+                    stderr_s
+                );
+
+                let body =
+                    ok_or_send_err!(resp.body.ok_or("response body was empty"), "{}", stderr_s);
+
+                let mut async_body = body.into_async_read();
+
+                ok_or_send_err!(
+                    tokio::io::copy(&mut async_body, &mut file).await,
+                    "{}",
+                    stderr_s
+                );
+
+                stdout_s
+                    .send(format!("{}: completed\n", key))
+                    .await
+                    .unwrap();
             }
         });
 
