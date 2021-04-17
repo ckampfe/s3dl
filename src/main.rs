@@ -2,9 +2,9 @@ use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use rusoto_core::Region;
 use rusoto_s3::S3;
-use std::io::BufRead;
 use std::path::{Path, PathBuf};
-use structopt::*;
+use std::{io::BufRead, str::FromStr};
+use structopt::StructOpt;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::channel;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -24,13 +24,17 @@ struct Options {
     keys_path: PathBuf,
 
     /// Where the downloaded files should be written.
-    #[structopt(long, short)]
+    #[structopt(long, short = "o")]
     out_path: PathBuf,
 
     /// The maximum number of inflight tasks.
     /// Defaults to (number of cpus * 10)
     #[structopt(long, short)]
     max_inflight_requests: Option<usize>,
+
+    /// What to do when attempting to download a file that already exists locally
+    #[structopt(long, short = "e", possible_values = &OnExistingFile::variants(), default_value = "skip")]
+    on_existing_file: OnExistingFile,
 
     /// The AWS region. Overrides the region found using the provider chain.
     #[structopt(long, short)]
@@ -45,6 +49,35 @@ struct Options {
     /// You generally shouldn't need to worry about this.
     #[structopt(long, default_value = DEFAULT_CHANNEL_BUFFER_CAPACITY)]
     stderr_channel_capacity: usize,
+}
+
+#[derive(Clone, Copy)]
+enum OnExistingFile {
+    Skip,
+    Overwrite,
+    Error,
+}
+
+impl OnExistingFile {
+    fn variants() -> [&'static str; 3] {
+        ["skip", "overwrite", "error"]
+    }
+}
+
+impl FromStr for OnExistingFile {
+    type Err = std::io::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "skip" => Ok(OnExistingFile::Skip),
+            "overwrite" => Ok(OnExistingFile::Overwrite),
+            "error" => Ok(OnExistingFile::Error),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "file_write_mode must be one of {skip|overwrite|error}",
+            )),
+        }
+    }
 }
 
 macro_rules! ok_or_send_err {
@@ -104,6 +137,7 @@ async fn main() -> Result<()> {
         bucket,
         options.keys_path,
         options.out_path,
+        options.on_existing_file,
         stdout_s,
         stderr_s,
         max_inflight_requests,
@@ -121,6 +155,7 @@ async fn download_keys(
     bucket: String,
     keys_path: PathBuf,
     out_path: PathBuf,
+    on_existing_file: OnExistingFile,
     stdout_s: Sender<String>,
     stderr_s: Sender<String>,
     max_inflight_requests: usize,
@@ -153,11 +188,28 @@ async fn download_keys(
 
                 stdout_s.send(format!("{}: started\n", key)).await.unwrap();
 
-                let resp = ok_or_send_err!(client.get_object(req).await, "{}", stderr_s);
-
                 let filename = Path::new(&key).file_name().unwrap();
 
                 out.push(filename);
+
+                match &on_existing_file {
+                    OnExistingFile::Skip => {
+                        if Path::new(&out).exists() {
+                            return;
+                        }
+                    }
+                    OnExistingFile::Error => {
+                        if Path::new(&out).exists() {
+                            ok_or_send_err!(
+                                Err(anyhow::anyhow!("{:?} already exists", key)),
+                                "{}",
+                                stderr_s
+                            );
+                            return;
+                        }
+                    }
+                    OnExistingFile::Overwrite => (),
+                }
 
                 let mut file = ok_or_send_err!(
                     tokio::fs::File::create(&out)
@@ -166,6 +218,8 @@ async fn download_keys(
                     "{}",
                     stderr_s
                 );
+
+                let resp = ok_or_send_err!(client.get_object(req).await, "{}", stderr_s);
 
                 let body =
                     ok_or_send_err!(resp.body.ok_or("response body was empty"), "{}", stderr_s);
