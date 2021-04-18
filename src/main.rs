@@ -5,11 +5,8 @@ use rusoto_s3::S3;
 use std::path::{Path, PathBuf};
 use std::{io::BufRead, str::FromStr};
 use structopt::StructOpt;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc::channel;
-use tokio::sync::mpsc::{Receiver, Sender};
-
-const DEFAULT_CHANNEL_BUFFER_CAPACITY: &str = "100";
+use tracing::{error, info, Instrument};
+use tracing_subscriber::EnvFilter;
 
 /// Download files from S3 in parallel
 #[derive(StructOpt)]
@@ -27,10 +24,10 @@ struct Options {
     #[structopt(long, short = "o")]
     out_path: PathBuf,
 
-    /// The maximum number of inflight tasks.
+    /// The maximum number of inflight requests.
     /// Defaults to (number of cpus * 10)
     #[structopt(long, short)]
-    max_inflight_requests: Option<usize>,
+    parallelism: Option<usize>,
 
     /// What to do when attempting to download a file that already exists locally
     #[structopt(long, short = "e", possible_values = &OnExistingFile::variants(), default_value = "skip")]
@@ -40,22 +37,18 @@ struct Options {
     #[structopt(long, short)]
     region: Option<Region>,
 
-    /// The size of the channel that synchronizes writes to stdout.
-    /// You generally shouldn't need to worry about this.
-    #[structopt(long, default_value = DEFAULT_CHANNEL_BUFFER_CAPACITY)]
-    stdout_channel_capacity: usize,
-
-    /// The size of the channel that synchronizes writes to stderr.
-    /// You generally shouldn't need to worry about this.
-    #[structopt(long, default_value = DEFAULT_CHANNEL_BUFFER_CAPACITY)]
-    stderr_channel_capacity: usize,
+    #[structopt(long, short = "l", possible_values = &EventFormat::variants(), default_value = "full")]
+    event_format: EventFormat,
 }
 
 #[derive(Clone, Copy)]
 enum OnExistingFile {
+    /// Do not download the file, and do not log anything.
     Skip,
-    Overwrite,
+    /// Do not download the file, log an error
     Error,
+    /// Download and overwrite the file
+    Overwrite,
 }
 
 impl OnExistingFile {
@@ -74,21 +67,61 @@ impl FromStr for OnExistingFile {
             "error" => Ok(OnExistingFile::Error),
             _ => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "file_write_mode must be one of {skip|overwrite|error}",
+                format!(
+                    "file_write_mode must be one of {:?}",
+                    OnExistingFile::variants()
+                ),
             )),
         }
     }
 }
 
-macro_rules! ok_or_send_err {
-    ($result:expr, $err_fmt_str:expr, $err_chan:ident) => {
+enum EventFormat {
+    Full,
+    Compact,
+    Pretty,
+    Json,
+}
+
+impl EventFormat {
+    fn variants() -> [&'static str; 4] {
+        ["full", "compact", "pretty", "json"]
+    }
+}
+
+impl FromStr for EventFormat {
+    type Err = std::io::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "full" => Ok(EventFormat::Full),
+            "compact" => Ok(EventFormat::Compact),
+            "pretty" => Ok(EventFormat::Pretty),
+            "json" => Ok(EventFormat::Json),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("event_format must be one of {:?}", EventFormat::variants()),
+            )),
+        }
+    }
+}
+
+macro_rules! ok_or_err {
+    ($result:expr) => {
         match $result {
             Ok(value) => value,
             Err(e) => {
-                return $err_chan
-                    .send(format!(concat!($err_fmt_str, "\n"), e))
-                    .await
-                    .unwrap()
+                error!(error = %e);
+                return;
+            }
+        }
+    };
+    ($result:expr, $key:expr) => {
+        match $result {
+            Ok(value) => value,
+            Err(e) => {
+                error!(key = $key.as_str(), error = %e);
+                return;
             }
         }
     };
@@ -98,25 +131,7 @@ macro_rules! ok_or_send_err {
 async fn main() -> Result<()> {
     let options = Options::from_args();
 
-    let (stdout_s, mut stdout_r): (Sender<String>, Receiver<String>) =
-        channel(options.stdout_channel_capacity);
-    let (stderr_s, mut stderr_r): (Sender<String>, Receiver<String>) =
-        channel(options.stderr_channel_capacity);
-
-    let mut stdout = tokio::io::stdout();
-    let mut stderr = tokio::io::stderr();
-
-    let stdout_task = tokio::spawn(async move {
-        while let Some(msg) = stdout_r.recv().await {
-            stdout.write_all(msg.as_bytes()).await.unwrap();
-        }
-    });
-
-    let stderr_task = tokio::spawn(async move {
-        while let Some(msg) = stderr_r.recv().await {
-            stderr.write_all(msg.as_bytes()).await.unwrap();
-        }
-    });
+    configure_logging(&options);
 
     let region = if let Some(region) = options.region {
         region
@@ -124,28 +139,17 @@ async fn main() -> Result<()> {
         rusoto_core::Region::default()
     };
 
-    let max_inflight_requests = options
-        .max_inflight_requests
-        .unwrap_or_else(|| num_cpus::get() * 10);
-
     let client = rusoto_s3::S3Client::new(region);
-
-    let bucket = options.bucket;
 
     download_keys(
         client,
-        bucket,
+        options.bucket,
         options.keys_path,
         options.out_path,
         options.on_existing_file,
-        stdout_s,
-        stderr_s,
-        max_inflight_requests,
+        options.parallelism.unwrap_or_else(|| num_cpus::get() * 10),
     )
     .await?;
-
-    stdout_task.await?;
-    stderr_task.await?;
 
     Ok(())
 }
@@ -156,9 +160,7 @@ async fn download_keys(
     keys_path: PathBuf,
     out_path: PathBuf,
     on_existing_file: OnExistingFile,
-    stdout_s: Sender<String>,
-    stderr_s: Sender<String>,
-    max_inflight_requests: usize,
+    parallelism: usize,
 ) -> Result<()> {
     let keys_file = std::fs::File::open(&keys_path)?;
     let keys_buf = std::io::BufReader::new(keys_file);
@@ -176,17 +178,14 @@ async fn download_keys(
                 },
             ))
         })
-        .map(|res| {
+        .map(|res| async {
             // these are all just copying pointers
-            let stdout_s = stdout_s.clone();
-            let stderr_s = stderr_s.clone();
             let mut out = out_path.clone();
             let client = client.clone();
+            let (key, req) = ok_or_err!(res);
 
-            async move {
-                let (key, req) = ok_or_send_err!(res, "{}", stderr_s);
-
-                stdout_s.send(format!("{}: started\n", key)).await.unwrap();
+            let f = async move {
+                info!(key = key.as_str(), status = "started");
 
                 let filename = Path::new(&key).file_name().unwrap();
 
@@ -200,49 +199,83 @@ async fn download_keys(
                     }
                     OnExistingFile::Error => {
                         if Path::new(&out).exists() {
-                            ok_or_send_err!(
-                                Err(anyhow::anyhow!("{:?} already exists", key)),
-                                "{}",
-                                stderr_s
-                            );
-                            return;
+                            ok_or_err!(Err(anyhow::anyhow!("{:?} already exists", key)), key);
                         }
                     }
                     OnExistingFile::Overwrite => (),
                 }
 
-                let mut file = ok_or_send_err!(
+                let mut file = ok_or_err!(
                     tokio::fs::File::create(&out)
                         .await
                         .with_context(|| format!("Could not create local file: {:?}", out)),
-                    "{}",
-                    stderr_s
+                    key
                 );
 
-                let resp = ok_or_send_err!(client.get_object(req).await, "{}", stderr_s);
+                let resp = ok_or_err!(client.get_object(req).await, key);
 
-                let body =
-                    ok_or_send_err!(resp.body.ok_or("response body was empty"), "{}", stderr_s);
+                let body = ok_or_err!(resp.body.ok_or("response body was empty"), key);
 
                 let mut async_body = body.into_async_read();
 
-                ok_or_send_err!(
-                    tokio::io::copy(&mut async_body, &mut file).await,
-                    "{}",
-                    stderr_s
-                );
+                ok_or_err!(tokio::io::copy(&mut async_body, &mut file).await, key);
 
-                stdout_s
-                    .send(format!("{}: completed\n", key))
-                    .await
-                    .unwrap();
-            }
+                info!(key = key.as_str(), status = "finished");
+            };
+
+            let this_span = tracing::info_span!("s3dl::download_keys");
+
+            f.instrument(this_span).await
         });
 
-    let mut buffered = stream.buffer_unordered(max_inflight_requests);
+    let mut buffered = stream.buffer_unordered(parallelism);
 
     // we do it this way because Rust does not have async for-loops yet
     while buffered.next().await.is_some() {}
 
     Ok(())
+}
+
+// this function is stupid-long due to the way tracing does formatting types
+// https://github.com/tokio-rs/tracing/issues/575
+fn configure_logging(options: &Options) {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    let tracing_builder = tracing_subscriber::FmtSubscriber::builder()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr);
+
+    match options.event_format {
+        EventFormat::Full => {
+            let subscriber = tracing_builder.finish();
+
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("setting default subscriber failed");
+        }
+        EventFormat::Compact => {
+            let subscriber = tracing_builder
+                .event_format(tracing_subscriber::fmt::format().compact())
+                .finish();
+
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("setting default subscriber failed");
+        }
+
+        EventFormat::Pretty => {
+            let subscriber = tracing_builder
+                .event_format(tracing_subscriber::fmt::format().pretty())
+                .finish();
+
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("setting default subscriber failed");
+        }
+        EventFormat::Json => {
+            let subscriber = tracing_builder
+                .event_format(tracing_subscriber::fmt::format().json())
+                .finish();
+
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("setting default subscriber failed");
+        }
+    };
 }
