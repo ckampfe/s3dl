@@ -5,7 +5,7 @@ use rusoto_s3::S3;
 use std::path::{Path, PathBuf};
 use std::{io::BufRead, str::FromStr};
 use structopt::StructOpt;
-use tracing::{error, info, Instrument};
+use tracing::{error, info, instrument};
 use tracing_subscriber::EnvFilter;
 
 /// Download files from S3 in parallel
@@ -166,67 +166,16 @@ async fn download_keys(
     let keys_buf = std::io::BufReader::new(keys_file);
     let keys_lines = futures_util::stream::iter(keys_buf.lines());
 
-    let stream = keys_lines
-        .map(|line| -> Result<(String, rusoto_s3::GetObjectRequest)> {
-            let key = line?;
-            Ok((
-                key.clone(),
-                rusoto_s3::GetObjectRequest {
-                    bucket: bucket.clone(),
-                    key,
-                    ..Default::default()
-                },
-            ))
-        })
-        .map(|res| async {
-            // these are all just copying pointers
-            let mut out = out_path.clone();
-            let client = client.clone();
-            let (key, req) = ok_or_err!(res);
-
-            let f = async move {
-                info!(key = key.as_str(), status = "started");
-
-                let filename = Path::new(&key).file_name().unwrap();
-
-                out.push(filename);
-
-                match &on_existing_file {
-                    OnExistingFile::Skip => {
-                        if Path::new(&out).exists() {
-                            return;
-                        }
-                    }
-                    OnExistingFile::Error => {
-                        if Path::new(&out).exists() {
-                            ok_or_err!(Err(anyhow::anyhow!("{:?} already exists", key)), key);
-                        }
-                    }
-                    OnExistingFile::Overwrite => (),
-                }
-
-                let mut file = ok_or_err!(
-                    tokio::fs::File::create(&out)
-                        .await
-                        .with_context(|| format!("Could not create local file: {:?}", out)),
-                    key
-                );
-
-                let resp = ok_or_err!(client.get_object(req).await, key);
-
-                let body = ok_or_err!(resp.body.ok_or("response body was empty"), key);
-
-                let mut async_body = body.into_async_read();
-
-                ok_or_err!(tokio::io::copy(&mut async_body, &mut file).await, key);
-
-                info!(key = key.as_str(), status = "finished");
-            };
-
-            let this_span = tracing::info_span!("s3dl::download_keys");
-
-            f.instrument(this_span).await
-        });
+    let stream = keys_lines.map(|line| {
+        let key = line.unwrap();
+        download_key(
+            client.clone(),
+            bucket.clone(),
+            key,
+            out_path.clone(),
+            on_existing_file,
+        )
+    });
 
     let mut buffered = stream.buffer_unordered(parallelism);
 
@@ -234,6 +183,60 @@ async fn download_keys(
     while buffered.next().await.is_some() {}
 
     Ok(())
+}
+
+#[instrument(skip(client, bucket, out_path, on_existing_file))]
+async fn download_key(
+    client: rusoto_s3::S3Client,
+    bucket: String,
+    key: String,
+    out_path: PathBuf,
+    on_existing_file: OnExistingFile,
+) {
+    let mut out_path = out_path;
+
+    let req = rusoto_s3::GetObjectRequest {
+        bucket,
+        key: key.clone(),
+        ..Default::default()
+    };
+
+    info!(key = key.as_str(), status = "started");
+
+    let filename = Path::new(&key).file_name().unwrap();
+
+    out_path.push(filename);
+
+    match &on_existing_file {
+        OnExistingFile::Skip => {
+            if Path::new(&out_path).exists() {
+                return;
+            }
+        }
+        OnExistingFile::Error => {
+            if Path::new(&out_path).exists() {
+                ok_or_err!(Err(anyhow::anyhow!("{:?} already exists", key)), key);
+            }
+        }
+        OnExistingFile::Overwrite => (),
+    }
+
+    let mut file = ok_or_err!(
+        tokio::fs::File::create(&out_path)
+            .await
+            .with_context(|| format!("Could not create local file: {:?}", out_path)),
+        key
+    );
+
+    let resp = ok_or_err!(client.get_object(req).await, key);
+
+    let body = ok_or_err!(resp.body.ok_or("response body was empty"), key);
+
+    let mut async_body = body.into_async_read();
+
+    ok_or_err!(tokio::io::copy(&mut async_body, &mut file).await, key);
+
+    info!(key = key.as_str(), status = "finished");
 }
 
 // this function is stupid-long due to the way tracing does formatting types
