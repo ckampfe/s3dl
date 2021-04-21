@@ -5,7 +5,7 @@ use rusoto_s3::S3;
 use std::path::{Path, PathBuf};
 use std::{io::BufRead, str::FromStr};
 use structopt::StructOpt;
-use tracing::{error, info, instrument};
+use tracing::instrument;
 use tracing_subscriber::EnvFilter;
 
 /// Download files from S3 in parallel
@@ -106,27 +106,6 @@ impl FromStr for EventFormat {
     }
 }
 
-macro_rules! ok_or_err {
-    ($result:expr) => {
-        match $result {
-            Ok(value) => value,
-            Err(e) => {
-                error!(error = %e);
-                return;
-            }
-        }
-    };
-    ($result:expr, $key:expr) => {
-        match $result {
-            Ok(value) => value,
-            Err(e) => {
-                error!(key = $key.as_str(), error = %e);
-                return;
-            }
-        }
-    };
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let options = Options::from_args();
@@ -166,8 +145,7 @@ async fn download_keys(
     let keys_buf = std::io::BufReader::new(keys_file);
     let keys_lines = futures_util::stream::iter(keys_buf.lines());
 
-    let stream = keys_lines.map(|line| {
-        let key = line.unwrap();
+    let stream = keys_lines.map(|line| line.unwrap()).map(|key| {
         download_key(
             client.clone(),
             bucket.clone(),
@@ -185,14 +163,14 @@ async fn download_keys(
     Ok(())
 }
 
-#[instrument(skip(client, bucket, out_path, on_existing_file))]
+#[instrument(err, skip(client, bucket, out_path, on_existing_file))]
 async fn download_key(
     client: rusoto_s3::S3Client,
     bucket: String,
     key: String,
     out_path: PathBuf,
     on_existing_file: OnExistingFile,
-) {
+) -> Result<()> {
     let mut out_path = out_path;
 
     let req = rusoto_s3::GetObjectRequest {
@@ -201,8 +179,6 @@ async fn download_key(
         ..Default::default()
     };
 
-    info!(key = key.as_str(), status = "started");
-
     let filename = Path::new(&key).file_name().unwrap();
 
     out_path.push(filename);
@@ -210,33 +186,32 @@ async fn download_key(
     match &on_existing_file {
         OnExistingFile::Skip => {
             if Path::new(&out_path).exists() {
-                return;
+                return Ok(());
             }
         }
         OnExistingFile::Error => {
             if Path::new(&out_path).exists() {
-                ok_or_err!(Err(anyhow::anyhow!("{:?} already exists", key)), key);
+                return Err(anyhow::anyhow!("{:?} already exists", key));
             }
         }
         OnExistingFile::Overwrite => (),
     }
 
-    let mut file = ok_or_err!(
-        tokio::fs::File::create(&out_path)
-            .await
-            .with_context(|| format!("Could not create local file: {:?}", out_path)),
-        key
-    );
+    let mut file = tokio::fs::File::create(&out_path)
+        .await
+        .with_context(|| format!("Could not create local file: {:?}", out_path))?;
 
-    let resp = ok_or_err!(client.get_object(req).await, key);
+    let resp = client.get_object(req).await?;
 
-    let body = ok_or_err!(resp.body.ok_or("response body was empty"), key);
+    let body = resp
+        .body
+        .ok_or(anyhow::anyhow!("response body was empty"))?;
 
     let mut async_body = body.into_async_read();
 
-    ok_or_err!(tokio::io::copy(&mut async_body, &mut file).await, key);
+    tokio::io::copy(&mut async_body, &mut file).await?;
 
-    info!(key = key.as_str(), status = "finished");
+    Ok(())
 }
 
 // this function is stupid-long due to the way tracing does formatting types
@@ -245,6 +220,10 @@ fn configure_logging(options: &Options) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     let tracing_builder = tracing_subscriber::FmtSubscriber::builder()
+        .with_span_events(
+            tracing_subscriber::fmt::format::FmtSpan::NEW
+                | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
+        )
         .with_env_filter(filter)
         .with_writer(std::io::stderr);
 
