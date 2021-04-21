@@ -205,7 +205,7 @@ async fn download_key(
 
     let body = resp
         .body
-        .ok_or(anyhow::anyhow!("response body was empty"))?;
+        .ok_or_else(|| anyhow::anyhow!("response body was empty"))?;
 
     let mut async_body = body.into_async_read();
 
