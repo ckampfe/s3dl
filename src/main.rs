@@ -8,17 +8,17 @@ use structopt::StructOpt;
 use tracing::instrument;
 use tracing_subscriber::EnvFilter;
 
-/// Download files from S3 in parallel
+/// Download files from S3 in parallel.
 #[derive(StructOpt)]
 struct Options {
     /// The target S3 bucket.
-    #[structopt(long, short)]
+    #[structopt(long, short = "b")]
     bucket: String,
 
     /// A path to a newline-separated file of AWS S3 keys to download.
     /// The keys should be relative, like `a/path/to/a/file.jpg`
-    #[structopt(long, short)]
-    keys_path: PathBuf,
+    #[structopt(long, short = "f")]
+    keys_file: PathBuf,
 
     /// Where the downloaded files should be written.
     #[structopt(long, short = "o")]
@@ -26,19 +26,25 @@ struct Options {
 
     /// The maximum number of inflight requests.
     /// Defaults to (number of cpus * 10)
-    #[structopt(long, short)]
+    #[structopt(long, short = "p")]
     parallelism: Option<usize>,
 
     /// What to do when attempting to download a file that already exists locally
-    #[structopt(long, short = "e", possible_values = &OnExistingFile::variants(), default_value = "skip")]
+    #[structopt(long, short = "x", possible_values = &OnExistingFile::variants(), default_value = "skip")]
     on_existing_file: OnExistingFile,
 
     /// The AWS region. Overrides the region found using the provider chain.
-    #[structopt(long, short)]
+    #[structopt(long, short = "r")]
     region: Option<Region>,
 
-    #[structopt(long, short = "l", possible_values = &EventFormat::variants(), default_value = "full")]
+    /// The logging format.
+    #[structopt(long, short = "e", possible_values = &EventFormat::variants(), default_value = "full")]
     event_format: EventFormat,
+
+    /// Force keys to download in the order in which they appear in `keys_file`.
+    /// By default, keys are downloaded in a nondeterministic order.
+    #[structopt(long, short = "d")]
+    ordered: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -123,10 +129,11 @@ async fn main() -> Result<()> {
     download_keys(
         client,
         options.bucket,
-        options.keys_path,
+        options.keys_file,
         options.out_path,
         options.on_existing_file,
         options.parallelism.unwrap_or_else(|| num_cpus::get() * 10),
+        options.ordered,
     )
     .await?;
 
@@ -136,12 +143,13 @@ async fn main() -> Result<()> {
 async fn download_keys(
     client: rusoto_s3::S3Client,
     bucket: String,
-    keys_path: PathBuf,
+    keys_file: PathBuf,
     out_path: PathBuf,
     on_existing_file: OnExistingFile,
     parallelism: usize,
+    ordered: bool,
 ) -> Result<()> {
-    let keys_file = std::fs::File::open(&keys_path)?;
+    let keys_file = std::fs::File::open(&keys_file)?;
     let keys_buf = std::io::BufReader::new(keys_file);
     let keys_lines = futures_util::stream::iter(keys_buf.lines());
 
@@ -155,10 +163,13 @@ async fn download_keys(
         )
     });
 
-    let mut buffered = stream.buffer_unordered(parallelism);
-
-    // we do it this way because Rust does not have async for-loops yet
-    while buffered.next().await.is_some() {}
+    if ordered {
+        let mut buffered = stream.buffered(parallelism);
+        while buffered.next().await.is_some() {}
+    } else {
+        let mut buffered = stream.buffer_unordered(parallelism);
+        while buffered.next().await.is_some() {}
+    };
 
     Ok(())
 }
