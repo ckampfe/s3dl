@@ -28,26 +28,28 @@ s3dl 0.1.0
 Download files from S3 in parallel
 
 USAGE:
-    s3dl [OPTIONS] --bucket <bucket> --keys-path <keys-path> --out-path <out-path>
+    s3dl [FLAGS] [OPTIONS] --bucket <bucket> --keys-file <keys-file> --out-path <out-path>
 
 FLAGS:
     -h, --help       Prints help information
+    -d, --ordered    Force keys to download in the order in which they appear in `keys_file`. By default, keys are
+                     downloaded in a nondeterministic order
     -V, --version    Prints version information
 
 OPTIONS:
     -b, --bucket <bucket>                        The target S3 bucket
-    -l, --event-format <event-format>             [default: full]  [possible values: full, compact, pretty, json]
-    -k, --keys-path <keys-path>
+    -e, --event-format <event-format>
+            The logging format [default: full]  [possible values: full, compact, pretty, json]
+
+    -f, --keys-file <keys-file>
             A path to a newline-separated file of AWS S3 keys to download. The keys should be relative, like
             `a/path/to/a/file.jpg`
-    -e, --on-existing-file <on-existing-file>
+    -x, --on-existing-file <on-existing-file>
             What to do when attempting to download a file that already exists locally [default: skip]  [possible values:
             skip, overwrite, error]
     -o, --out-path <out-path>                    Where the downloaded files should be written
     -p, --parallelism <parallelism>
             The maximum number of inflight requests. Defaults to (number of cpus * 10)
-
-    -r, --region <region>                        The AWS region. Overrides the region found using the provider chain
 ```
 
 ## todo
