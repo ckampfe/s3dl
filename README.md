@@ -54,6 +54,4 @@ OPTIONS:
 
 ## todo
 
-- [ ] options for what to do when a file already exists? replace/ignore/error
 - [ ] quiet mode?
-- [ ] logging instead of echo to stdout?
