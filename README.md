@@ -18,7 +18,7 @@ c.png
 d.png
 e.rs
 $ mkdir out
-$ s3dl --bucket mybucket --keys-path my_s3_files.txt -o out
+$ s3dl --bucket mybucket --keys-file my_s3_files.txt -o out
 ```
 
 ## use/options
