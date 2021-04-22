@@ -263,6 +263,9 @@ fn configure_logging(options: &Options) {
                 .expect("setting default subscriber failed");
         }
         EventFormat::Json => {
+            // TODO: this does not currently output keys
+            // https://github.com/tokio-rs/tracing/issues/1032
+            // https://github.com/tokio-rs/tracing/pull/1334
             let subscriber = tracing_builder
                 .event_format(tracing_subscriber::fmt::format().json())
                 .finish();
