@@ -126,10 +126,14 @@ async fn main() -> Result<()> {
 
     let client = rusoto_s3::S3Client::new(region);
 
+    let keys_file = std::fs::File::open(&options.keys_file)?;
+    let keys_buf = std::io::BufReader::new(keys_file);
+    let keys = futures_util::stream::iter(keys_buf.lines()).map(|line| line.unwrap());
+
     download_keys(
         client,
         options.bucket,
-        options.keys_file,
+        keys,
         options.out_path,
         options.on_existing_file,
         options.parallelism.unwrap_or_else(|| num_cpus::get() * 10),
@@ -140,20 +144,16 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn download_keys(
+async fn download_keys<K: futures_util::stream::Stream<Item = String> + std::marker::Unpin>(
     client: rusoto_s3::S3Client,
     bucket: String,
-    keys_file: PathBuf,
+    keys: K,
     out_path: PathBuf,
     on_existing_file: OnExistingFile,
     parallelism: usize,
     ordered: bool,
 ) -> Result<()> {
-    let keys_file = std::fs::File::open(&keys_file)?;
-    let keys_buf = std::io::BufReader::new(keys_file);
-    let keys_lines = futures_util::stream::iter(keys_buf.lines());
-
-    let stream = keys_lines.map(|line| line.unwrap()).map(|key| {
+    let stream = keys.map(|key| {
         download_key(
             client.clone(),
             bucket.clone(),
