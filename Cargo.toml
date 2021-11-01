@@ -15,7 +15,7 @@ rusoto_s3 = "0.47"
 structopt = "0.3"
 tokio = { version = "1", features = ["fs", "io-std"] }
 tracing = "0.1"
-tracing-subscriber = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 [profile.release]
 codegen-units = 1
